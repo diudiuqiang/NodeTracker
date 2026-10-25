@@ -1,0 +1,28 @@
+# ---- Build artifacts ----
+dist/
+build/
+build_*/
+build_tmp/
+dist_tmp/
+__pycache__/
+*.pyc
+*.pyo
+*.spec.bak
+
+# ---- Local runtime data (user-specific, never commit) ----
+tracker_config.json
+tracker_links.json
+*.linkmap
+*.linkmap.json
+live_sub.b64
+sub_b64.txt
+*.log
+.kernel_pids
+*.db
+tmp_*
+
+# ---- OS / editor ----
+Thumbs.db
+.DS_Store
+.vscode/
+.idea/
