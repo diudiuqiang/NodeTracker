@@ -11,7 +11,6 @@
   · 最终订阅 = 核心组(交集) ∪ 新秀组(动态)
 
 v1.3 新增（借鉴 SubsCheck-Win-GUI）:
-  · 🆓 一键填充 GitHub 免费节点源（68 个聚合订阅）
   · Github 加速前缀（raw.githubusercontent 直连不通时用）
   · ④ 订阅服务：本地 HTTP 常驻订阅 + 局域网 IP 选择 + 一键复制订阅 URL
   · 订阅保留节点数 / 测速下限过滤
@@ -30,15 +29,18 @@ import csv
 import os
 import json
 import base64
+import time
 import threading
 import datetime
 import traceback
 import urllib.parse
 import urllib.request
+import urllib.error
 import statistics
 import random
 import http.server
 import subprocess
+import tempfile
 import tkinter as tk
 from tkinter import ttk, scrolledtext, messagebox, filedialog
 from concurrent.futures import ThreadPoolExecutor
@@ -54,7 +56,7 @@ except Exception:
 # 内核探测模块（sing-box Clash API，准确测所有协议延迟+真实下载速度）
 import singbox_probe as sb
 
-__version__ = "1.9.3"
+__version__ = "1.9.12"
 
 # v1.9 修复（2026-10-24，「GUI 显示 10 个但 v2rayN 只进 5 个」）：
 #  P0-4 vmess 节点被 v2rayN 全量丢弃（根因读 v2rayN 源码实锤）：
@@ -114,6 +116,12 @@ SRC_PROXY_CANDIDATES = ["socks5h://127.0.0.1:10809", "socks5h://127.0.0.1:10808"
                         "http://127.0.0.1:10809", "http://127.0.0.1:10808",
                         "socks5h://192.168.31.254:7890", "http://192.168.31.254:7890"]
 
+# v1.9.4 订阅源自动过滤：免费源大量 404 是常态，软件应在「抓取层」自动屏蔽失效源，
+# 不让用户手动维护。判定：404/410 = 源被删（永久失效，立即屏蔽）；其它（超时/连接错/5xx）
+# = 瞬时故障，连续失败达到阈值才屏蔽（避免被限流误杀）。屏蔽后冷却期到自动重试（免费源常复活）。
+DEAD_SUB_COOLDOWN = 3            # 天：失效源屏蔽多少天后自动重试
+TRANSIENT_DEAD_THRESHOLD = 5     # 连续瞬时失败次数达到即屏蔽
+
 
 def _proxy_alive(prefix, timeout=6, via="", as_prefix=True):
     """v1.7 探活 gh 代理：经代理拉一个已知存在的小文件（HEAD 失败退化 GET）
@@ -143,81 +151,85 @@ def _proxy_alive(prefix, timeout=6, via="", as_prefix=True):
     except Exception:
         return False
 
+
+def _http_fetch_with_status(url, proxy="", timeout=20):
+    """v1.9.4 先探一次 HTTP 状态码再决定要不要解析。
+
+    load_subscription() 把网络异常全部吞掉返回 []，导致 404 源被误算成「成功 0 节点」。
+    这里自己拉一次并带出状态码，调用方据此区分「源已删(404/410)」与「瞬时故障」。
+    返回 (status, body)：status 为 int 或 None（完全连不上）。
+    """
+    if proxy:
+        try:
+            fd, tmp = tempfile.mkstemp()
+            os.close(fd)
+            cmd = ["curl", "-s", "-L", "--max-time", str(timeout), "-o", tmp,
+                   "-w", "%{http_code}", url]
+            if proxy.lower().startswith(("socks", "socks5")):
+                cmd += ["--socks5-hostname", proxy.split("://", 1)[1]]
+            else:
+                cmd += ["-x", proxy]
+            r = subprocess.run(cmd, capture_output=True, text=True,
+                               timeout=timeout + 5,
+                               creationflags=0x08000000 if os.name == "nt" else 0)
+            code = (r.stdout or "").strip()
+            try:
+                status = int(code)
+            except Exception:
+                status = None
+            body = None
+            if status and 100 <= status < 400:
+                try:
+                    with open(tmp, "r", encoding="utf-8", errors="replace") as f:
+                        body = f.read()
+                except Exception:
+                    body = None
+            try:
+                os.unlink(tmp)
+            except Exception:
+                pass
+            return status, body
+        except Exception:
+            return None, None
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return resp.status, resp.read().decode("utf-8", "replace")
+    except urllib.error.HTTPError as e:
+        return e.code, None
+    except Exception:
+        return None, None
+
+
+def _is_active_dead(rec, now, cooldown=DEAD_SUB_COOLDOWN,
+                    thresh=TRANSIENT_DEAD_THRESHOLD):
+    """v1.9.4 判断一条失效记录当前是否仍处于「应跳过」状态（纯函数，便于测试）。"""
+    if not rec:
+        return False
+    age_days = (now - rec.get("ts", 0)) / 86400.0
+    if age_days > cooldown:
+        return False  # 冷却到期，允许重试
+    if rec.get("reason") == "gone":
+        return True
+    if rec.get("reason") == "transient" and rec.get("fails", 0) >= thresh:
+        return True
+    return False
+
+
+def _classify_fetch(status):
+    """v1.9.4 把 HTTP 状态码映射成 dead_subs 记录类型。"""
+    if status in (404, 410):
+        return "gone"
+    if status is None or status >= 400:
+        return "transient"
+    return "ok"
+
 # ⚠️ 数据文件必须落在 exe/脚本自身所在目录，不能依赖 CWD
 # （否则从其它目录启动、或 CWD 不可写时，历史与配置会静默写失败）
 BASE_DIR = (os.path.dirname(sys.executable) if getattr(sys, "frozen", False)
             else os.path.dirname(os.path.abspath(__file__)))
 HISTORY_FILE = os.path.join(BASE_DIR, "node_history.csv")
 CONFIG_FILE = os.path.join(BASE_DIR, "tracker_config.json")
-
-# 内置免费节点源（借鉴 SubsCheck「一键获取 GitHub 免费节点」）
-FREE_SOURCES = [
-    "https://raw.githubusercontent.com/snakem982/proxypool/main/source/clash-meta.yaml",
-    "https://raw.githubusercontent.com/snakem982/proxypool/main/source/clash-meta-2.yaml",
-    "https://raw.githubusercontent.com/go4sharing/sub/main/sub.yaml",
-    "https://raw.githubusercontent.com/SoliSpirit/v2ray-configs/main/all_configs.txt",
-    "https://raw.githubusercontent.com/firefoxmmx2/v2rayshare_subcription/main/subscription/clash_sub.yaml",
-    "https://raw.githubusercontent.com/Roywaller/clash_subscription/main/clash_subscription.txt",
-    "https://raw.githubusercontent.com/Q3dlaXpoaQ/V2rayN_Clash_Node_Getter/main/APIs/sc0.yaml",
-    "https://raw.githubusercontent.com/Q3dlaXpoaQ/V2rayN_Clash_Node_Getter/main/APIs/sc1.yaml",
-    "https://raw.githubusercontent.com/Q3dlaXpoaQ/V2rayN_Clash_Node_Getter/main/APIs/sc2.yaml",
-    "https://raw.githubusercontent.com/Q3dlaXpoaQ/V2rayN_Clash_Node_Getter/main/APIs/sc3.yaml",
-    "https://raw.githubusercontent.com/Q3dlaXpoaQ/V2rayN_Clash_Node_Getter/main/APIs/sc4.yaml",
-    "https://raw.githubusercontent.com/xiaoji235/airport-free/main/clash/naidounode.txt",
-    "https://raw.githubusercontent.com/mahdibland/SSAggregator/master/sub/sub_merge_yaml.yml",
-    "https://raw.githubusercontent.com/mahdibland/ShadowsocksAggregator/master/Eternity.yml",
-    "https://raw.githubusercontent.com/vxiaov/free_proxies/main/clash/clash.provider.yaml",
-    "https://raw.githubusercontent.com/leetomlee123/freenode/main/README.md",
-    "https://raw.githubusercontent.com/chengaopan/AutoMergePublicNodes/master/list.yml",
-    "https://raw.githubusercontent.com/ermaozi/get_subscribe/main/subscribe/clash.yml",
-    "https://raw.githubusercontent.com/zhangkaiitugithub/passcro/main/speednodes.yaml",
-    "https://raw.githubusercontent.com/mgit0001/test_clash/main/heima.txt",
-    "https://raw.githubusercontent.com/mai19950/clashgithub_com/main/site",
-    "https://raw.githubusercontent.com/mai19950/sites/main/sub/v2ray/base64",
-    "https://raw.githubusercontent.com/aiboboxx/v2rayfree/main/v2",
-    "https://raw.githubusercontent.com/Pawdroid/Free-servers/main/sub",
-    "https://raw.githubusercontent.com/shahidbhutta/Clash/main/Router",
-    "https://raw.githubusercontent.com/anaer/Sub/main/clash.yaml",
-    "https://raw.githubusercontent.com/free18/v2ray/main/c.yaml",
-    "https://raw.githubusercontent.com/peasoft/NoMoreWalls/master/list.yml",
-    "https://raw.githubusercontent.com/mfbpn/tg_mfbpn_sub/main/trial.yaml",
-    "https://raw.githubusercontent.com/Ruk1ng001/freeSub/main/clash.yaml",
-    "https://raw.githubusercontent.com/ripaojiedian/freenode/main/clash",
-    "https://raw.githubusercontent.com/mfuu/v2ray/master/clash.yaml",
-    "https://raw.githubusercontent.com/xiaoji235/airport-free/main/v2ray.txt",
-    "https://raw.githubusercontent.com/vxiaov/free_proxies/main/links.txt",
-    "https://raw.githubusercontent.com/xiaoji235/airport-free/main/v2ray/v2rayshare.txt",
-    "https://raw.githubusercontent.com/MrMohebi/xray-proxy-grabber-telegram/master/collected-proxies/clash-meta/all.yaml",
-    "https://raw.githubusercontent.com/ts-sf/fly/main/clash",
-    "https://raw.githubusercontent.com/Barabama/FreeNodes/main/nodes/yudou66.txt",
-    "https://raw.githubusercontent.com/Barabama/FreeNodes/main/nodes/clashmeta.txt",
-    "https://raw.githubusercontent.com/Barabama/FreeNodes/main/nodes/ndnode.txt",
-    "https://raw.githubusercontent.com/Barabama/FreeNodes/main/nodes/nodev2ray.txt",
-    "https://raw.githubusercontent.com/Barabama/FreeNodes/main/nodes/nodefree.txt",
-    "https://raw.githubusercontent.com/Barabama/FreeNodes/main/nodes/v2rayshare.txt",
-    "https://raw.githubusercontent.com/Barabama/FreeNodes/main/nodes/wenode.txt",
-    "https://raw.githubusercontent.com/ggborr/FREEE-VPN/main/4V2ray",
-    "https://raw.githubusercontent.com/SamanGho/v2ray_collector/main/v2tel_links1.txt",
-    "https://raw.githubusercontent.com/SamanGho/v2ray_collector/main/v2tel_links2.txt",
-    "https://raw.githubusercontent.com/acymz/AutoVPN/main/data/V2.txt",
-    "https://raw.githubusercontent.com/peacefish/nodefree/main/sub/proxy_cf.yaml",
-    "https://raw.githubusercontent.com/darknessm427/IranConfigCollector/main/V2.txt",
-    "https://raw.githubusercontent.com/NiceVPN123/NiceVPN/main/utils/pool/output.yaml",
-    "https://raw.githubusercontent.com/yorkLiu/FreeV2RayNode/main/v2ray.txt",
-    "https://raw.githubusercontent.com/gfpcom/free-proxy-list/main/list/ss.txt",
-    "https://raw.githubusercontent.com/gfpcom/free-proxy-list/main/list/ssr.txt",
-    "https://raw.githubusercontent.com/gfpcom/free-proxy-list/main/list/trojan.txt",
-    "https://raw.githubusercontent.com/gfpcom/free-proxy-list/main/list/vless.txt",
-    "https://raw.githubusercontent.com/gfpcom/free-proxy-list/main/list/vmess.txt",
-    "https://raw.githubusercontent.com/NiceVPN123/NiceVPN/main/Clash.yaml",
-    "https://raw.githubusercontent.com/lagzian/SS-Collector/main/SS/trinity_clash.yaml",
-    "https://raw.githubusercontent.com/lagzian/SS-Collector/main/SS/VM_TrinityBase",
-    "https://raw.githubusercontent.com/lagzian/SS-Collector/main/SS/TrinityBase",
-    "https://raw.githubusercontent.com/darknessm427/IranConfigCollector/main/bulk/ss_iran.txt",
-    "https://raw.githubusercontent.com/darknessm427/IranConfigCollector/main/bulk/trojan_iran.txt",
-    "https://raw.githubusercontent.com/darknessm427/IranConfigCollector/main/bulk/vless_iran.txt",
-    "https://raw.githubusercontent.com/darknessm427/IranConfigCollector/main/bulk/vmess_iran.txt",
-]
 
 # 常见 GitHub 加速前缀（可手填其它）
 GH_PROXIES = ["", "https://gh-proxy.com/", "https://ghfast.top/", "https://gh-proxy.net/"]
@@ -821,6 +833,37 @@ def summarize(agg):
     return s
 
 
+def _history_sample_weight(rec):
+    """
+    v1.9.5 其余节点加权抽样的权重（输入：analyze() 的某节点聚合记录，或 None）。
+
+    设计动机：非自建源可用率实测仅 2~3%（见 _worker 故障轮判定注释）。
+    旧版每轮 `random.shuffle` 盲抽样 → 把 ~97% 探针预算浪费在已知垃圾上，
+    且刚发现的好节点下一轮又被随机洗掉、永远攒不够历史进「核心/新秀」组。
+    本函数用历史把预算向已证明可用的幸存节点集中：
+
+      · 无历史（本轮新出现的节点）→ 基础权重 1.0，保证持续发现新源；
+      · 有历史 → 以可用率为主轴（0%→0.2，100%→2.0），再按分组修正：
+          核心/新秀：重点保留（已证明可用，需持续累积历史稳住最终组）
+          观察    ：略加权
+          淘汰    ：大幅降权（已知坏，但不永久剔除——源更新后可能复活，仍偶尔探）
+    """
+    if not rec:
+        return 1.0
+    avail = float(rec.get("avail%", 0) or 0)
+    w = 0.2 + (avail / 100.0) * 1.8          # 0%→0.2，50%→1.1，100%→2.0
+    g = rec.get("group", "") or ""
+    if "核心" in g or "新秀" in g:
+        w += 2.0
+    elif "观察" in g:
+        w += 0.5
+    elif "淘汰" in g:
+        w = max(0.1, w * 0.3)                 # 已知坏 → 大幅降权但仍留一线
+    return max(0.05, w)
+
+
+
+
 # ============================================================ 本地订阅 HTTP 服务
 class SubHTTPServer(http.server.ThreadingHTTPServer):
     daemon_threads = True
@@ -1140,6 +1183,8 @@ class App(tk.Tk):
         self._timer = None
         self._round = 0
         self._fallback_n = 0        # 本轮订阅里兜底补进来的节点数
+        self.dead_subs = {}         # v1.9.4 失效订阅源记录 {url: {ts,fails,reason}}
+
         # 轮次从历史续接：否则每次重启软件 round 都归 1，
         # 多轮数据被算成「同一轮」，覆盖率/可用率统计会失真
         try:
@@ -1307,10 +1352,6 @@ class App(tk.Tk):
         ttk.Label(bar, text="(raw.githubusercontent 直连超时时选一个；留空=直连)",
                   style="Big.TLabel", foreground="#666666").pack(side="left")
 
-        ttk.Button(bar, text="🆓 一键填充免费节点源",
-                   style="Big.TButton",
-                   command=self._fill_free_sources).pack(side="right", padx=4)
-
         ttk.Button(bar, text="📥 一键导入 v2rayN",
                    style="Big.TButton",
                    command=self._import_v2rayn).pack(side="right", padx=4)
@@ -1358,6 +1399,14 @@ class App(tk.Tk):
         ttk.Label(f, text="💡 以 # 开头的行会被忽略。订阅链接与手动节点会合并进同一个测速池。",
                   style="Big.TLabel", foreground="#666666").pack(anchor="w")
 
+        # v1.9.10：显式「保存全部设置」按钮（订阅链接 / 自有节点 在此编辑，必须能主动落盘）
+        save_bar = ttk.Frame(f)
+        save_bar.pack(fill="x", pady=(10, 0))
+        ttk.Button(save_bar, text="💾 保存全部设置", style="Big.TButton",
+                   command=self._save_all_settings).pack(side="left", padx=(0, 8))
+        ttk.Label(save_bar, text="（订阅链接 / 自有节点 / 参数 一次性落盘，避免只在框里改了却没保存）",
+                  style="Big.TLabel", foreground="#666666").pack(side="left")
+
         # v1.9.3：构建完界面后刷新内核状态（此时 config 已加载）
         self._refresh_kernel_status()
 
@@ -1391,19 +1440,6 @@ class App(tk.Tk):
         self.txt_nodes.delete("1.0", "end")
         self._save_config()
         self.status_msg(f"已清空 {n} 个手动节点。")
-
-    def _fill_free_sources(self):
-        """一键填充内置免费节点源（借鉴 SubsCheck）"""
-        if not messagebox.askyesno(
-                "一键填充",
-                f"将把 {len(FREE_SOURCES)} 条 GitHub 免费节点源填入订阅框（覆盖现有内容）。\n\n"
-                "这些源会聚合出上千个公共节点，配合定时测速+交集统计，\n"
-                "自动筛出真正可用的少数好节点。\n\n继续？"):
-            return
-        self.txt_subs.delete("1.0", "end")
-        self.txt_subs.insert("1.0", "\n".join(FREE_SOURCES) + "\n")
-        self.status_msg(f"已填充 {len(FREE_SOURCES)} 条免费节点源。"
-                        "建议先测一轮看通量，节点太多时可删减部分源。")
 
     # ------------------------------------------------------ v1.9.3 内核获取
     def _refresh_kernel_status(self):
@@ -1825,6 +1861,23 @@ class App(tk.Tk):
                         variable=self.exclude_vmess,
                         style="Big.TCheckbutton").pack(side="left", padx=(16, 0))
 
+        # v1.9.4 失效订阅源自动过滤状态：软件自动屏蔽 404/长期失败的源，无需手动维护
+        bar4 = ttk.Frame(f)
+        bar4.pack(fill="x", pady=(0, 6))
+        self.lbl_dead_subs = tk.StringVar(value="失效源屏蔽: 0 个（软件自动过滤，无需手动）")
+        ttk.Label(bar4, textvariable=self.lbl_dead_subs, style="Big.TLabel",
+                  foreground="#a35200").pack(side="left")
+        ttk.Button(bar4, text="🔄 重置失效源屏蔽", style="Big.TButton",
+                   command=self._reset_dead_subs).pack(side="left", padx=(12, 0))
+
+        # v1.9.10：显式「保存全部设置」按钮（把上方设置 + ①里的订阅链接/节点一次性保存）
+        bar_save = ttk.Frame(f)
+        bar_save.pack(fill="x", pady=(0, 8))
+        ttk.Button(bar_save, text="💾 保存全部设置", style="Big.TButton",
+                   command=self._save_all_settings).pack(side="left", padx=(0, 8))
+        ttk.Label(bar_save, text="（把上方所有设置 + ①里的订阅链接 / 自有节点一次性保存落盘）",
+                  style="Big.TLabel", foreground="#666666").pack(side="left")
+
         self.lbl_srv = tk.StringVar(value="订阅服务未开启。")
         ttk.Label(f, textvariable=self.lbl_srv, style="Big.TLabel",
                   foreground="#1c5fb0").pack(anchor="w", pady=(4, 12))
@@ -1836,6 +1889,41 @@ class App(tk.Tk):
         ttk.Label(f, text="提示: 复制订阅时可选局域网 IP，手机等其它设备在同一 WiFi 下也能订阅。"
                           "服务绑定 0.0.0.0，选哪个 IP 只影响复制出来的 URL。",
                   style="Big.TLabel", foreground="#666666").pack(anchor="w")
+
+    # ---------------------------------------------- 失效源自动过滤（v1.9.4）
+    def _refresh_dead_label(self, now=None):
+        """刷新「已屏蔽失效源」状态标签。"""
+        if not hasattr(self, "lbl_dead_subs"):
+            return
+        try:
+            now = now or time.time()
+            n = sum(1 for _u, r in self.dead_subs.items()
+                    if _is_active_dead(r, now))
+        except Exception:
+            n = 0
+        if n:
+            self.lbl_dead_subs.set(
+                f"⚠️ 已自动屏蔽 {n} 个失效源（404/长期失败；冷却 {DEAD_SUB_COOLDOWN} 天后自动重试）")
+        else:
+            self.lbl_dead_subs.set("失效源屏蔽: 0 个（软件自动过滤，无需手动）")
+
+    def _reset_dead_subs(self):
+        """清空失效源屏蔽记录，立即重新尝试所有源（含被屏蔽的）。"""
+        if not getattr(self, "dead_subs", {}):
+            self.status_msg("当前没有已屏蔽的失效源。")
+            return
+        if not messagebox.askyesno(
+                "重置失效源屏蔽",
+                f"将清除 {len(self.dead_subs)} 条失效源屏蔽记录，\n"
+                "下一轮开始会重新尝试全部订阅源（包括之前被屏蔽的）。\n\n继续？"):
+            return
+        self.dead_subs = {}
+        try:
+            self._save_config()
+        except Exception:
+            pass
+        self._refresh_dead_label()
+        self.status_msg("已重置失效源屏蔽，下一轮将重试全部源。")
 
     # ---------------------------------------------- 最终组构建（导出+订阅服务共用）
     def _build_final_links(self):
@@ -2188,6 +2276,8 @@ class App(tk.Tk):
                 self.own_keys.insert(0, d.get("own_keys", ""))
                 self.sample_n.set(str(d.get("sample_n", 300)))
                 self.top_n.set(str(d.get("top_n", DEFAULT_PICK_N)))
+                self.dead_subs = d.get("dead_subs", {}) or {}
+                self._refresh_dead_label()
         except Exception:
             pass
 
@@ -2221,10 +2311,39 @@ class App(tk.Tk):
                 "singbox_kernel": _sbk,
                 "own_keys": self.own_keys.get(),
                 "sample_n": self.sample_n.get(),
+                "dead_subs": getattr(self, "dead_subs", {}),
             }, open(CONFIG_FILE, "w", encoding="utf-8"),
                  ensure_ascii=False, indent=1)
         except Exception:
             pass
+
+    # ------------------------------------------------------ v1.9.10 显式「保存全部设置」
+    def _save_all_settings(self):
+        """用户主动点击「保存全部设置」：把节点来源、订阅链接、各项参数一次性落盘。
+
+        解决此前只改 GUI 文本框、却没触发任何保存操作（开启服务/清空/导出/关闭窗口），
+        导致磁盘 tracker_config.json 停留在旧值、重启后又读回旧配置的问题。
+        """
+        try:
+            self._save_config()
+            # 落盘校验：重读配置文件，比对订阅文本与 top_n 是否真的写进去了
+            ok = False
+            try:
+                if os.path.exists(CONFIG_FILE):
+                    d = json.load(open(CONFIG_FILE, encoding="utf-8"))
+                    ok = (d.get("subs", "") == self.txt_subs.get("1.0", "end")
+                          and d.get("top_n", "") == self.top_n.get())
+            except Exception:
+                ok = False
+            if ok:
+                self.status_msg("✅ 全部设置已保存落盘（订阅链接 / 自有节点 / 参数）")
+            else:
+                self.status_msg("⚠️ 保存可能未生效，请检查配置文件写入权限")
+        except Exception as e:
+            try:
+                messagebox.showerror("保存失败", f"写入配置文件失败：\n{e}")
+            except Exception:
+                pass
 
     # ------------------------------------------------------ 节点链接映射（用于导出订阅）
     LINKMAP_FILE = os.path.join(BASE_DIR, "tracker_links.json")
@@ -2332,9 +2451,14 @@ class App(tk.Tk):
         items = []
         meta = {}            # tag -> 原始备注名
         seen = set()        # (server, port) 去重
+        tag2src = {}        # tag -> 来源订阅 URL（手动节点留空，用于按源质量统计）
+        ech_skip = 0
         for l in manual_links:
             it = sb.parse_link_to_item(l)
             if not it:
+                continue
+            if it.get("needs_ech"):   # v1.9.8: v2rayN 私有 ECH 格式，标准内核 FATAL → 跳过
+                ech_skip += 1
                 continue
             key = (it["outbound"].get("server"), it["outbound"].get("server_port"))
             if key in seen:
@@ -2342,6 +2466,9 @@ class App(tk.Tk):
             seen.add(key)
             items.append(it)
             meta[it["outbound"]["tag"]] = _remark_of(l)
+        if ech_skip:
+            self.after(0, self.status_msg,
+                       f"ℹ️ 跳过 {ech_skip} 个 v2rayN 私有 ECH 节点（标准内核不可测，v2rayN 可用）")
         # 订阅并发拉取：68 个源串行最多要 68×20s≈22 分钟且期间界面毫无反馈
         fetch_ok, fetch_fail = 0, 0
         if sub_urls:
@@ -2375,38 +2502,82 @@ class App(tk.Tk):
                         self.after(0, self.status_msg,
                                    "⚠️ 所有 gh 代理探活失败，本轮订阅拉取可能大面积失败")
 
+            now = time.time()
+            # v1.9.4 订阅源自动过滤：跳过仍处于屏蔽期的失效源（冷却到期这里会放行重试）
+            to_fetch, skipped = [], []
+            for u in sub_urls:
+                rec = self.dead_subs.get(u)
+                if _is_active_dead(rec, now):
+                    skipped.append(u)
+                else:
+                    to_fetch.append(u)
+
             def _fetch_one(url):
                 fetch = url
                 if prefix and url.startswith("https://raw.githubusercontent.com"):
                     fetch = prefix + url
                 try:
-                    return url, sb.load_subscription(fetch, proxy=src_proxy), None
+                    status, body = _http_fetch_with_status(fetch, src_proxy,
+                                                          timeout=20)
                 except Exception as e:
-                    return url, [], str(e)
+                    return url, [], str(e), "transient"
+                kind = _classify_fetch(status)
+                if kind != "ok":
+                    return url, [], f"HTTP {status}", kind
+                try:
+                    items = sb.load_subscription(body, proxy="")
+                    return url, items, None, "ok"
+                except Exception as e:
+                    return url, [], str(e), "transient"
 
             done_n = 0
             # ⚠️ 并发 8 而非 16：实测 16 并发经 SOCKS5 代理拉大源（3MB）会拥挤
             # 超时误杀（sc1/sc2 单跑 6s/14s 成功，16 并发里全 0）
-            with ThreadPoolExecutor(max_workers=min(8, len(sub_urls))) as pool:
-                for url, got, err in pool.map(_fetch_one, sub_urls):
-                    done_n += 1
-                    if err:
-                        fetch_fail += 1
-                    else:
-                        fetch_ok += 1
-                    self.after(0, self.lbl_progress.set,
-                               f"正在拉取订阅 {done_n}/{len(sub_urls)} …")
-                    for it in (got or []):
-                        key = (it["outbound"].get("server"),
-                               it["outbound"].get("server_port"))
-                        if key in seen:
-                            continue
-                        seen.add(key)
-                        items.append(it)
-                        meta[it["outbound"]["tag"]] = _remark_of(it["link"])
+            if to_fetch:
+                with ThreadPoolExecutor(max_workers=min(8, len(to_fetch))) as pool:
+                    for url, got, err, kind in pool.map(_fetch_one, to_fetch):
+                        done_n += 1
+                        # v1.9.4 据实更新失效源记录（主线程更新，线程安全）
+                        if kind == "ok":
+                            self.dead_subs.pop(url, None)
+                        elif kind == "gone":
+                            rec = self.dead_subs.setdefault(url, {"fails": 0})
+                            rec["reason"] = "gone"
+                            rec["fails"] = rec.get("fails", 0) + 1
+                            rec["ts"] = now
+                        else:  # transient
+                            rec = self.dead_subs.setdefault(url, {"fails": 0})
+                            rec["reason"] = "transient"
+                            rec["fails"] = rec.get("fails", 0) + 1
+                            rec["ts"] = now
+                        if err or kind != "ok":
+                            fetch_fail += 1
+                        else:
+                            fetch_ok += 1
+                        self.after(0, self.lbl_progress.set,
+                                   f"正在拉取订阅 {done_n}/{len(to_fetch)} "
+                                   f"（已跳过 {len(skipped)} 个失效源）…")
+                        for it in (got or []):
+                            key = (it["outbound"].get("server"),
+                                   it["outbound"].get("server_port"))
+                            if key in seen:
+                                continue
+                            seen.add(key)
+                            items.append(it)
+                            meta[it["outbound"]["tag"]] = _remark_of(it["link"])
+                            tag2src[it["outbound"]["tag"]] = url   # 来源 URL（自动剔除用）
+            # 落盘失效源记录（持久化，重启后仍生效；不依赖用户手动维护）
+            try:
+                self._save_config()
+            except Exception:
+                pass
             # 拉取结果反馈（原来失败完全静默，用户以为卡住）
-            tip = f"订阅拉取: 成功 {fetch_ok} / 失败 {fetch_fail}"
+            dead_now = sum(1 for _u, r in self.dead_subs.items()
+                           if _is_active_dead(r, now))
+            tip = (f"订阅拉取: 成功 {fetch_ok} / 失败 {fetch_fail}"
+                   f" / 跳过失效源 {len(skipped)}（累计屏蔽 {dead_now}）")
             self.after(0, self.lbl_progress.set, tip)
+            self.after(0, self._refresh_dead_label, now)
 
         if not items:
             self.after(0, lambda: messagebox.showwarning(
@@ -2423,10 +2594,11 @@ class App(tk.Tk):
             new_tag = f"n{idx}"
             it["outbound"]["tag"] = new_tag
             meta[new_tag] = name
+            tag2src[new_tag] = tag2src.pop(old, "")   # 来源映射跟随重命名
             uniq.append(it)
         items = uniq
 
-        # 2b) 分池：自建节点精测(多次取中位数) + 免费节点抽样(避免上万节点把内核拖死)
+        # 2b) 分池：自建节点精测(多次取中位数) + 其余节点抽样(避免上万节点把内核拖死)
         own_keys = [k.strip() for k in (getattr(self, "own_keys", None)
                                         and self.own_keys.get() or "").split(",")
                     if k.strip()]
@@ -2437,27 +2609,59 @@ class App(tk.Tk):
 
         if own_keys:
             own_items = [it for it in items if is_own(it)]
-            free_items = [it for it in items if not is_own(it)]
+            other_items = [it for it in items if not is_own(it)]
         else:
-            own_items, free_items = [], items
+            own_items, other_items = [], items
 
         try:
             sample_n = int(self.sample_n.get() or 0)
         except Exception:
             sample_n = 0
-        if sample_n > 0 and len(free_items) > sample_n:
-            random.shuffle(free_items)
-            free_items = free_items[:sample_n]
+        if sample_n > 0 and len(other_items) > sample_n:
+            # v1.9.5 历史感知抽样：用历史可用率/分组给其余节点加权，把有限探针
+            # 预算集中在已证明可用的幸存节点上——避免每轮盲随机把 ~97% 预算
+            # 浪费在已知垃圾、且让刚发现的好节点下一轮又被洗掉永远进不了最终组。
+            # 无历史时所有权重=1.0 → 退化为纯随机，首轮行为与旧版一致。
+            _hist = {}
+            try:
+                _hrows = load_history()
+                if _hrows:
+                    _ownk = [k.strip() for k in (getattr(self, "own_keys", None)
+                                                 and self.own_keys.get() or "").split(",")
+                             if k.strip()]
+                    for _r in analyze(_hrows, own_keys=_ownk):
+                        _hist[(str(_r.get("host")), str(_r.get("port")))] = _r
+            except Exception:
+                _hist = {}
+            for _it in other_items:
+                _hk = (str(_it["outbound"].get("server")),
+                       str(_it["outbound"].get("server_port")))
+                _w = _history_sample_weight(_hist.get(_hk))
+                # 指数抽样（Efraimidis-Spirakis）：权重越大越靠前，且天然无重复
+                _it["_sw"] = random.expovariate(max(_w, 1e-6))
+            other_items.sort(key=lambda _it: _it["_sw"])
+            other_items = other_items[:sample_n]
 
-        # 批次：自建每批 200 且每个节点测 3 次；免费每批 300 测 1 次
+        # 批次：自建每批 200 且每个节点测 3 次；其余节点每批 300 测 1 次
         batches = []
         for i in range(0, len(own_items), 200):
             batches.append((own_items[i:i + 200], OWN_REPEAT))
-        for i in range(0, len(free_items), 300):
-            batches.append((free_items[i:i + 300], 1))
+        for i in range(0, len(other_items), 300):
+            batches.append((other_items[i:i + 300], 1))
         if not batches:
             batches = [(items, 1)]
-        total_items = len(own_items) + len(free_items)
+        total_items = len(own_items) + len(other_items)
+
+        # v1.9.7 每轮正式探测前，先清理上一轮残留的 sing-box 内核（含「命令行空串」的
+        # 漏网僵尸——它会在端口释放竞态里卡住本轮内核启动，导致整轮 delay 全 0）。
+        # 仅 app 启动时清一次不够：连续跑轮时轮间僵尸清不掉。
+        try:
+            _k = sb.kill_stale_kernels()
+            if _k:
+                self.after(0, self.status_msg,
+                           f"🧹 已清理 {_k} 个残留内核进程（防整轮全灭）")
+        except Exception:
+            pass
 
         # 2) 阶段A：分批测延迟（单批太大会让内核起不来 → 整轮全灭）
         self.after(0, self._pb_to_determinate, total_items)
@@ -2534,6 +2738,10 @@ class App(tk.Tk):
             # 可控的，它们不通用意昧着内核/代理真出问题，才是可靠的故障探针。
             _bad_round = False
             _bad_desc = ""
+            # v1.9.12：内核启动失败会把 stderr 落盘（GUI 下 print 看不见），
+            # 把 FATAL 原文直接展示出来 —— 这次「整轮全灭」就是因为看不到
+            # "unknown congestion control algorithm: none" 才排查了那么久。
+            _kerr = (getattr(sb, "LAST_KERNEL_ERROR", None) or {}).get("text", "")
             if own_items:
                 _own_res = [r for r in res
                             if r["tag"] in {it["outbound"]["tag"]
@@ -2554,6 +2762,7 @@ class App(tk.Tk):
                     _bad_desc = (f"本轮 {len(res)} 个节点仅 {_ok_n} 个测通"
                                  f"（{_rate*100:.1f}%），低于 {BAD_ROUND_RATE*100:.0f}% 剔除线")
             if _bad_round:
+                _extra = (f"\n\n【内核报错原文】\n{_kerr[-800:]}" if _kerr else "")
                 self.after(0, lambda: messagebox.showwarning(
                     "⚠️ 本轮全灭（历史数据已冻结）",
                     f"{_bad_desc}，本轮已按故障轮剔除、不进统计。\n\n"
@@ -2561,7 +2770,8 @@ class App(tk.Tk):
                     "· sing-box 内核异常 / 端口冲突\n"
                     "· 拉源代理失效（①号页 socks5h://127.0.0.1:10809）\n"
                     "· gh_proxy 失效（已内置自动切换，全挂会另出提示）\n\n"
-                    "免费节点存活率低是常态，不算故障；连续全灭时订阅会停更。"))
+                    "免费节点存活率低是常态，不算故障；连续全灭时订阅会停更。"
+                    + _extra))
             records = []
             for r in res:
                 records.append({
@@ -2588,11 +2798,21 @@ class App(tk.Tk):
                 linkmap.setdefault(name, r["link"])   # 兼容旧版按名字查 + host:port 兜底
             self._save_linkmap(linkmap)
 
-            append_history(records)
-            agg = analyze(load_history())
-            self.after(0, self._fill, agg, rnd, cancelled)
-            # 订阅服务内容随测速结果自动更新
-            self.after(0, self._update_served)
+            # v1.9.7 故障轮（内核/代理异常致整轮近乎全灭）真正不写历史、不刷表，
+            # 避免污染节点稳定性评分；此前仅弹警告却仍写入，等于把垃圾当有效数据。
+            if not _bad_round:
+                append_history(records)
+                agg = analyze(load_history())
+                self.after(0, self._fill, agg, rnd, cancelled)
+                # 订阅服务内容随测速结果自动更新
+                self.after(0, self._update_served)
+            else:
+                self.after(0, self.status_msg,
+                           "⚠️ 本轮判定为故障轮，已丢弃未写入历史（既有统计不受影响）")
+            # 内核报错但没构成全灭轮时，也要在状态栏留一句（完整原文见 kernel_errors.log）
+            if _kerr and not _bad_round:
+                self.after(0, self.status_msg,
+                           f"⚠️ 内核有报错（详见 kernel_errors.log）：{_kerr[-120]}")
         except Exception:
             err = traceback.format_exc()
             self.after(0, lambda: messagebox.showerror(

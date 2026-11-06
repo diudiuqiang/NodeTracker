@@ -43,6 +43,11 @@ DEFAULT_TEST_TIMEOUT_MS = 5000
 PROTO_PREFIXES = ("vmess://", "vless://", "trojan://", "ss://", "ssr://",
                  "hysteria2://", "hy2://", "tuic://", "anytls://")
 
+# TUIC 合法拥塞控制算法（sing-box 1.14 只认这三个）
+# ⚠️ 订阅/手填链接里出现 none 等非法值会让内核配置加载 FATAL → 整轮节点全灭
+#    （2026-11-04 v1.9.10 事故根因）。解析与建配置时统一回退 bbr。
+VALID_TUIC_CC = ("bbr", "cubic", "new_reno")
+
 
 # ============================================================ 工具函数
 def _b64decode(s):
@@ -122,17 +127,22 @@ def parse_link_to_item(link):
         return None
 
     if proto == "vless":
-        return _parse_vless(userinfo, host, port, query, remark, used, link)
-    if proto == "trojan":
-        return _parse_trojan(userinfo, host, port, query, remark, used, link)
-    if proto in ("hysteria2", "hy2"):
-        return _parse_hysteria2(userinfo, host, port, query, remark, used, link)
-    if proto == "tuic":
-        return _parse_tuic(userinfo, host, port, query, remark, used, link)
-    if proto == "anytls":
-        return _parse_anytls(userinfo, host, port, query, remark, used, link)
-    if proto == "ss":
-        return _parse_ss(rest, query, remark, used, link)
+        it = _parse_vless(userinfo, host, port, query, remark, used, link)
+    elif proto == "trojan":
+        it = _parse_trojan(userinfo, host, port, query, remark, used, link)
+    elif proto in ("hysteria2", "hy2"):
+        it = _parse_hysteria2(userinfo, host, port, query, remark, used, link)
+    elif proto == "tuic":
+        it = _parse_tuic(userinfo, host, port, query, remark, used, link)
+    elif proto == "anytls":
+        it = _parse_anytls(userinfo, host, port, query, remark, used, link)
+    elif proto == "ss":
+        it = _parse_ss(rest, query, remark, used, link)
+    else:
+        return None
+    if it is not None:
+        _mark_ech(it, query)   # v1.9.8: 标记 v2rayN 私有 ECH 格式（标准内核 FATAL）→ 测速跳过
+    return it
     return None
 
 
@@ -156,6 +166,46 @@ def _tls_block(query, allow_insecure_key="allow_insecure"):
     if pin:
         block["certificate_public_key_sha256"] = pin
     return block
+
+
+def _mark_ech(item, query):
+    """标记 v2rayN 私有 ECH 格式节点（ech=domain+https://resolver）。
+
+    标准 sing-box core 不接受该格式（会 FATAL：invalid ECH configs pem），
+    v2rayN 用魔改内核才能连。NodeTracker 跳过这类节点的测速，避免：
+      ① outbound 初始化失败（比 delay=0 更糟）
+      ② 整批 delay=0 污染可用率统计
+    这些节点在 v2rayN 里可用，只是本工具标准内核无法测。"""
+    if not isinstance(item, dict):
+        return
+    ech = query.get("ech")
+    if ech and ("+https://" in ech or "+http://" in ech):
+        item["needs_ech"] = True
+
+
+def _sanitize_tuic_cc(ob):
+    """校验/修正 TUIC 的 congestion_control（v1.9.11 防全灭）。
+
+    sing-box 1.14 只接受 bbr / cubic / new_reno。订阅或手填链接里的
+    none 等非法值会让内核配置加载 FATAL，导致**整轮节点全灭**（不是单个
+    节点失败），危害极大。这里统一回退到 bbr，保证节点仍可测。
+
+    返回 True 表示发生了修正（非法值 → bbr）。
+    只改 outbound，不新增未知字段（sing-box 对未知字段会报错）。
+    """
+    if not isinstance(ob, dict) or ob.get("type") != "tuic":
+        return False
+    cc = ob.get("congestion_control")
+    if cc is None:
+        ob["congestion_control"] = "bbr"
+        return True
+    cc = str(cc).strip().lower()
+    if cc in VALID_TUIC_CC:
+        if cc != ob.get("congestion_control"):
+            ob["congestion_control"] = cc
+        return False
+    ob["congestion_control"] = "bbr"
+    return True
 
 
 def _transport(net, query):
@@ -214,6 +264,92 @@ def _parse_vmess(b64, remark, used, link):
     return {"tag": tag, "outbound": ob, "link": link, "proto": "vmess"}
 
 
+def _b64url_raw(s):
+    """
+    把 reality public_key 归一成 sing-box 要求的「raw URL-safe base64」。
+
+    ⚠️ 实测（2026-11-04，sing-box 1.14.4）：内核只认 base64.RawURLEncoding，
+    即字母表必须是 `-`/`_` 且【不能带 `=` 填充】。而 v2rayN / sing-box 导出、
+    各家订阅常见的 reality 链接用的是标准 base64（`+`/`/`，且补 `=`），
+    例如 `W8p01zKYvID6W31+pWr0XCvNop7JJFBBsXf+ltmYSBM=`：
+      · 原样喂给内核 → FATAL "decode public_key: illegal base64 data at input byte 15"
+      · 只换字母表留 `=` → FATAL "…at input byte 43"
+    一个坏 pbk 就让整个 outbounds 加载失败 → 内核起不来 → 整轮节点全灭，
+    和 TUIC congestion_control=none 是同一类事故，所以在这里统一消毒。
+    已是 raw url-safe 的值（43 字符无填充）做replace/rstrip 都是无操作，安全。
+    """
+    s = (s or "").strip()
+    if not s:
+        return s
+    return s.replace("+", "-").replace("/", "_").rstrip("=")
+
+
+def _sanitize_reality_pbk(ob):
+    """最后防线：确保 outbound 里的 reality.public_key 是内核认的格式（原地改写）"""
+    try:
+        r = (ob.get("tls") or {}).get("reality") or {}
+        pk = r.get("public_key")
+        if pk and isinstance(pk, str):
+            fixed = _b64url_raw(pk)
+            if fixed != pk:
+                r["public_key"] = fixed
+                return True
+    except Exception:
+        pass
+    return False
+
+
+# sing-box 1.14 的 VLESS 只认这一个 flow 值（实测：xtls-rx-vision / vision /
+# xtls-rprx-vision-udp443 全部 FATAL "unsupported flow"）。xtls-rx-vision 是
+# 市面上订阅里很常见的旧写法/错写法，一个就能让整轮全灭 → 归一化掉。
+VLESS_FLOW_OK = ("xtls-rprx-vision",)
+VLESS_FLOW_ALIAS = {"xtls-rx-vision": "xtls-rprx-vision"}
+
+# sing-box 的 hysteria2 obfs 只认 salamander（实测：其它值 FATAL "unknown obfs type"）
+HY2_OBFS_OK = ("salamander",)
+HY2_OBFS_FALLBACK = "salamander"
+
+
+def _sanitize_hy2_obfs(ob):
+    """最后防线：hysteria2 obfs 只保留内核认的类型（原地改写）"""
+    try:
+        o = ob.get("obfs")
+        if not isinstance(o, dict):
+            return False
+        t = str(o.get("type") or "").strip().lower()
+        if not t:
+            return False
+        if t in HY2_OBFS_OK:
+            return False
+        print(f"[消毒] hysteria2 obfs {t!r} 内核不支持 → {HY2_OBFS_FALLBACK!r}")
+        o["type"] = HY2_OBFS_FALLBACK
+        return True
+    except Exception:
+        return False
+
+
+def _sanitize_vless_flow(ob):
+    """
+    最后防线：VLESS flow 归一化（原地改写）。
+    已知旧写法 → 映射成内核认的值；内核不认的一律摘掉。
+    取舍：宁可这个节点少个流控（仍能连），也不能让一条坏 flow 搞死整轮。
+    """
+    f = ob.get("flow")
+    if not f:
+        return False
+    f = str(f).strip()
+    if f in VLESS_FLOW_OK:
+        return False
+    fixed = VLESS_FLOW_ALIAS.get(f.lower())
+    if fixed:
+        ob["flow"] = fixed
+        print(f"[消毒] VLESS flow {f!r} → {fixed!r}")
+        return True
+    ob.pop("flow", None)
+    print(f"[消毒] VLESS flow {f!r} 内核不支持，已摘除（避免整轮全灭）")
+    return True
+
+
 def _parse_vless(userinfo, host, port, query, remark, used, link):
     security = (query.get("security") or "none").lower()
     tag = _clean_tag(remark, used)
@@ -227,7 +363,8 @@ def _parse_vless(userinfo, host, port, query, remark, used, link):
     }
     flow = query.get("flow")
     if flow:
-        ob["flow"] = flow
+        # v1.9.12: 旧写法 xtls-rx-vision 在此就归一化（build_config 里还有最后防线）
+        ob["flow"] = VLESS_FLOW_ALIAS.get(str(flow).strip().lower(), str(flow).strip())
     t = _transport(query.get("type", "tcp"), query)
     if t:
         ob["transport"] = t
@@ -238,7 +375,7 @@ def _parse_vless(userinfo, host, port, query, remark, used, link):
             sid = query.get("sid") or ""
             r = {"enabled": True}
             if pbk:
-                r["public_key"] = pbk
+                r["public_key"] = _b64url_raw(pbk)   # v1.9.12: 消毒成 raw url-safe
             if sid:
                 r["short_id"] = sid
             tls["reality"] = r
@@ -275,7 +412,11 @@ def _parse_hysteria2(userinfo, host, port, query, remark, used, link):
     }
     obfs = query.get("obfs")
     if obfs:
-        ob["obfs"] = {"type": obfs, "password": query.get("obfs-password", "")}
+        # v1.9.12: sing-box 只认 salamander，别的值直接 FATAL "unknown obfs type"
+        # → 一个坏值搞死整轮。不认的一律退化成 salamander（比整轮全灭好得多）。
+        ob["obfs"] = {"type": str(obfs).strip().lower()
+                      if str(obfs).strip().lower() in HY2_OBFS_OK else HY2_OBFS_FALLBACK,
+                      "password": query.get("obfs-password", "")}
     return {"tag": tag, "outbound": ob, "link": link, "proto": "hysteria2"}
 
 
@@ -293,7 +434,12 @@ def _parse_tuic(userinfo, host, port, query, remark, used, link):
         "congestion_control": query.get("congestion_control", "bbr"),
         "tls": _tls_block(query),
     }
-    return {"tag": tag, "outbound": ob, "link": link, "proto": "tuic"}
+    # v1.9.11: 非法 cc（如 none）会让内核配置 FATAL → 整轮全灭，统一回退 bbr
+    cc_fixed = _sanitize_tuic_cc(ob)
+    item = {"tag": tag, "outbound": ob, "link": link, "proto": "tuic"}
+    if cc_fixed:
+        item["cc_normalized"] = True   # 仅记录在 item 层，不写进 sing-box 配置
+    return item
 
 
 def _parse_anytls(userinfo, host, port, query, remark, used, link):
@@ -574,6 +720,7 @@ def _clash_proxy_to_item(p, used):
                    "password": p.get("password") or ""})
         if p.get("congestion-controller"):
             ob["congestion_control"] = p.get("congestion-controller")
+        _sanitize_tuic_cc(ob)   # v1.9.11: Clash YAML 的 cc 也可能非法 → 回退 bbr
         if p.get("udp-relay-mode"):
             ob["udp_relay_mode"] = p.get("udp-relay-mode")
     elif t == "anytls":
@@ -687,6 +834,10 @@ def build_config(items, api_port=9090, secret="sbprobe", speed_port=None):
     node_tags = []
     for it in items:
         ob = dict(it["outbound"])
+        _sanitize_tuic_cc(ob)      # v1.9.11: 最后防线，防非法 cc 让内核 FATAL 整轮全灭
+        _sanitize_reality_pbk(ob)  # v1.9.12: 最后防线，防标准 base64 的 pbk 让内核 FATAL
+        _sanitize_vless_flow(ob)   # v1.9.12: 最后防线，防旧写法 flow 让内核 FATAL
+        _sanitize_hy2_obfs(ob)     # v1.9.12: 最后防线，防未知 obfs 类型让内核 FATAL
         node_tags.append(ob["tag"])
         outbounds.append(ob)
     # selector 聚合所有节点（clash api 需要可见 + 速度测试时切换用）
@@ -804,6 +955,58 @@ def _save_pids():
         pass
 
 
+# ---- 内核 stderr 落盘（v1.9.12）--------------------------------------------
+# 背景：2026-11-04「整轮 300 节点全灭」事故里，3 个 TUIC 节点带了非法
+# congestion_control=none → sing-box 配置加载 FATAL → 内核根本起不来。
+# 但 run_probe 把 stderr 丢进了 DEVNULL，FATAL 原因凭空消失，只能靠手工复现
+# 才查到。这里改为把 stderr 写临时文件：既不会像 PIPE 那样被 warning 塞满
+# 憋死内核，又能在启动失败时把根因取回来（GUI 下 print 不可见，必须落盘）。
+LAST_KERNEL_ERROR = {"text": "", "ts": ""}   # 最近一次内核启动失败的 stderr 尾部
+
+
+def _kernel_err_log_path():
+    """内核错误日志位置：打包后 = exe 目录，源码跑 = 源码目录"""
+    try:
+        base = (os.path.dirname(sys.executable) if getattr(sys, "frozen", False)
+                else os.path.dirname(os.path.abspath(__file__)))
+    except Exception:
+        base = os.getcwd()
+    return os.path.join(base, "kernel_errors.log")
+
+
+def _read_kernel_err(err_path, max_chars=1200):
+    """读内核 stderr 尾部（FATAL 原因总在最后几行）"""
+    try:
+        with open(err_path, "rb") as f:
+            f.seek(0, 2)
+            size = f.tell()
+            f.seek(max(0, size - 8192))
+            raw = f.read()
+        txt = raw.decode("utf-8", "replace").strip()
+        return txt[-max_chars:] if txt else ""
+    except Exception:
+        return ""
+
+
+def _record_kernel_error(err_path):
+    """把内核 stderr 尾部存到模块全局 + 追加到 kernel_errors.log（GUI 可见）"""
+    txt = _read_kernel_err(err_path)
+    if not txt:
+        return ""
+    LAST_KERNEL_ERROR["text"] = txt
+    LAST_KERNEL_ERROR["ts"] = time.strftime("%Y-%m-%d %H:%M:%S")
+    try:
+        _log = _kernel_err_log_path()
+        _sep = "" if (not os.path.exists(_log) or os.path.getsize(_log) == 0) else "\n"
+        with open(_log, "a", encoding="utf-8") as f:
+            f.write(f"{_sep}[{LAST_KERNEL_ERROR['ts']}] sing-box 内核启动失败\n"
+                    f"{txt}\n{'-' * 60}")
+    except Exception:
+        pass
+    print(f"[内核] 启动失败，stderr 尾部：\n{txt}")
+    return txt
+
+
 def _kernel_cmdlines():
     """返回 {pid: 命令行}（只列 sing-box.exe）；查不到就返回空 → 安全优先，不做清理"""
     if sys.platform != "win32":
@@ -832,23 +1035,27 @@ def kill_stale_kernels():
     """
     清理上次异常退出（被强杀/崩溃）残留的 sing-box 内核。
 
-    ⚠️ 关键：只杀「命令行含 sbprobe_」的进程 —— 那是我们自己的临时配置目录。
-    v2rayN 也在用 sing-box.exe，绝不能按进程名一刀切地杀。
+    ⚠️ 关键：只杀自己的内核，绝不碰 v2rayN 的。两种识别方式并用：
+      1) 命令行含 sbprobe_ —— 我们自己的临时配置目录（常规僵尸）
+      2) 命令行查出来是空串 —— Windows 上进程退出过渡态/僵尸，Get-CimInstance
+         返回空命令行，纯靠(1)会漏杀；这类正是「卡住下一轮端口 → 整轮全 0」的元凶。
+    判定安全边界：v2rayN 的内核命令行正常且不含 sbprobe_，不在其列，不会被误杀。
     """
     cmds = _kernel_cmdlines()
     if not cmds:
         return 0
     killed = 0
     for pid, cmd in cmds.items():
-        if "sbprobe_" not in (cmd or ""):
-            continue                      # 别人的内核，不碰
-        try:
-            subprocess.run(["taskkill", "/PID", str(pid), "/F"],
-                           capture_output=True, timeout=8,
-                           creationflags=0x08000000)
-            killed += 1
-        except Exception:
-            pass
+        c = (cmd or "").strip()
+        # 我们的内核：命令行含 sbprobe_，或命令行已查不到（空串 / 过渡态僵尸）
+        if ("sbprobe_" in c) or (c == ""):
+            try:
+                subprocess.run(["taskkill", "/PID", str(pid), "/F"],
+                               capture_output=True, timeout=8,
+                               creationflags=0x08000000)
+                killed += 1
+            except Exception:
+                pass
     return killed
 
 
@@ -919,13 +1126,36 @@ def run_probe(items, kernel=DEFAULT_KERNEL, api_port=9090, secret="sbprobe",
     """
     if not items:
         return [], False
+    # 每轮开头清掉上轮的错误，避免旧 FATAL 被当成新一轮的报错重复提示
+    LAST_KERNEL_ERROR["text"] = ""
+    LAST_KERNEL_ERROR["ts"] = ""
     if not os.path.exists(kernel):
         print(f"[内核] 未找到 sing-box: {kernel}")
         return ([{"tag": it["tag"], "link": it["link"], "proto": it["proto"],
                  "delay_ms": None, "speed_kbs": 0.0, "ok": False} for it in items], False)
+    err_path = ""   # 提前占位：build_config/mkdtemp 抛异常时 except 也要能安全引用
+
+    # ⚠️ tag 必须全局唯一（v1.9.12）：同名 tag 会让 sing-box 报
+    # "duplicate outbound/endpoint tag" → 配置加载 FATAL → 内核起不来 → 整轮全灭。
+    # 这个唯一化原先只在 node_stability_tracker._worker 里做，run_probe 作为公开
+    # 入口（probe_links / 外部脚本直接调它）自己不做，等于同一个坑还留着一条侧门：
+    # 2026-11-04 验证 stderr 捕获时实测复现过（18 个自有节点 tag 全是 "node" → 全灭）。
+    # 必须【原地】改写 it["outbound"]["tag"]：build_config、结果字典、_fail 读的都是
+    # 这个字段，只改副本会让返回结果的 tag 与调用方持有的 item 对不上。
+    _tag_seen = {}
+    for it in items:
+        ob = it.get("outbound") or {}
+        base = str(ob.get("tag") or "node").strip() or "node"
+        n = _tag_seen.get(base, 0)
+        _tag_seen[base] = n + 1
+        new_tag = base if n == 0 else f"{base}_{n}"
+        ob["tag"] = new_tag
+        if "tag" in it:          # 顶层 tag 与 outbound.tag 初始同值，一并同步保持一致
+            it["tag"] = new_tag
 
     # ⚠️ 端口必须自适应：同时开两个 exe（或别的程序占了 9090）时，
     # 后启动的内核绑不上端口 → Clash API 起不来 → 整轮节点全部判定失败却没有任何提示
+    api_port_used = api_port  # 保留原始端口，供启动竞态重试时换端口
     if not _port_free(api_port):
         api_port = _find_free_port(api_port + 1)
     if measure_speed:
@@ -941,20 +1171,57 @@ def run_probe(items, kernel=DEFAULT_KERNEL, api_port=9090, secret="sbprobe",
 
     base = f"http://127.0.0.1:{api_port}"
     proxy_url = f"http://127.0.0.1:{speed_port}" if measure_speed else None
-    proc = None
-    try:
-        proc = subprocess.Popen(
+
+    # stderr 写临时文件（不能用 PIPE：大量失败节点时内核 warning 会塞满 64KB
+    # 管道缓冲区，内核写日志被阻塞 → 整体冻住、所有 API 超时）
+    err_path = os.path.join(tmp, "kernel_stderr.log")
+    _err_handles = []
+
+    def _spawn():
+        fh = open(err_path, "wb")
+        _err_handles.append(fh)
+        p = subprocess.Popen(
             [kernel, "run", "-c", cfg_path],
-            # ⚠️ 不能用 PIPE：大量失败节点时内核 warning 会塞满 64KB 管道缓冲区，
-            # 内核写日志被阻塞 → 整体冻住、所有 API 超时。直接丢弃输出。
-            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL, stderr=fh,
             creationflags=0x08000000,  # CREATE_NO_WINDOW
         )
-        _ACTIVE_PIDS.add(proc.pid)
+        _ACTIVE_PIDS.add(p.pid)
         _save_pids()
+        return p
+
+    proc = None
+    try:
+        proc = _spawn()
         if not _wait_api(base, secret, startup_timeout):
-            print("[内核] Clash API 未就绪（启动超时或配置错误）")
-            return [_fail(it) for it in items], False
+            # 首次启动竞态（端口/SOCKET 释放延迟，或大规模节点内核起慢）：
+            # 换端口重启一次，兜住「偶发整轮全灭」
+            print("[内核] 首次启动未就绪，换端口重试一次…")
+            if proc:
+                try:
+                    proc.terminate(); proc.wait(timeout=5)
+                except Exception:
+                    pass
+            api_port = _find_free_port(api_port_used + 1)
+            if measure_speed:
+                speed_port = api_port + 1000
+                if not _port_free(speed_port):
+                    speed_port = _find_free_port(speed_port + 1)
+            cfg = build_config(items, api_port, secret,
+                               speed_port=speed_port if measure_speed else None)
+            with open(cfg_path, "w", encoding="utf-8") as f:
+                json.dump(cfg, f, ensure_ascii=False, indent=2)
+            base = f"http://127.0.0.1:{api_port}"
+            proxy_url = (f"http://127.0.0.1:{speed_port}" if measure_speed else None)
+            proc = _spawn()
+            if not _wait_api(base, secret, startup_timeout):
+                print("[内核] 重试后仍无法就绪（配置错误或服务异常）")
+                try:
+                    proc.terminate(); proc.wait(timeout=5)
+                except Exception:
+                    pass
+                # v1.9.12: 取回 FATAL 根因（TUIC cc=none 那类配置错误就靠这个定位）
+                _record_kernel_error(err_path)
+                return [_fail(it) for it in items], False
 
         proxies = _api_get(base, secret, "/proxies", timeout=8)
         valid = set(proxies.get("proxies", {}).keys()) if proxies else set()
@@ -1035,6 +1302,7 @@ def run_probe(items, kernel=DEFAULT_KERNEL, api_port=9090, secret="sbprobe",
         return results, cancelled
     except Exception as e:
         print(f"[内核] 运行异常: {e}")
+        _record_kernel_error(err_path)
         return [_fail(it) for it in items], False
     finally:
         if proc:
@@ -1049,6 +1317,11 @@ def run_probe(items, kernel=DEFAULT_KERNEL, api_port=9090, secret="sbprobe",
                     pass
             _ACTIVE_PIDS.discard(proc.pid)
             _save_pids()
+        for _fh in _err_handles:
+            try:
+                _fh.close()
+            except Exception:
+                pass
         try:
             shutil.rmtree(tmp, ignore_errors=True)
         except Exception:

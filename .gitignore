@@ -12,6 +12,9 @@ __pycache__/
 # ---- Local runtime data (user-specific, never commit) ----
 tracker_config.json
 tracker_links.json
+sources.ini
+src_quality.json
+.app.lock
 *.linkmap
 *.linkmap.json
 live_sub.b64
