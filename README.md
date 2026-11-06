@@ -1,6 +1,20 @@
 # NodeTracker
 
+[![最新版本](https://img.shields.io/github/v/release/diudiuqiang/NodeTracker?style=flat-square)](https://github.com/diudiuqiang/NodeTracker/releases/latest)
+[![下载量](https://img.shields.io/github/downloads/diudiuqiang/NodeTracker/total?style=flat-square)](https://github.com/diudiuqiang/NodeTracker/releases)
+[![开源协议](https://img.shields.io/github/license/diudiuqiang/NodeTracker?style=flat-square)](https://github.com/diudiuqiang/NodeTracker/blob/main/LICENSE)
+[![平台](https://img.shields.io/badge/平台-Windows-blue?style=flat-square)](https://github.com/diudiuqiang/NodeTracker/releases/latest)
+[![Star](https://img.shields.io/github/stars/diudiuqiang/NodeTracker?style=flat-square)](https://github.com/diudiuqiang/NodeTracker/stargazers)
+
 **订阅节点稳定性追踪器 / Subscription Node Stability Tracker**
+
+## ⬇️ 下载
+
+**[👉 下载 `NodeTracker.exe`（最新版 · Windows 单文件免安装）](https://github.com/diudiuqiang/NodeTracker/releases/latest/download/NodeTracker.exe)**
+
+双击即用——不需要装 Python，sing-box 内核找不到时用界面里的「一键下载内核」按钮即可。其他版本见 [Releases 页面](https://github.com/diudiuqiang/NodeTracker/releases)。
+
+---
 
 NodeTracker 是一个本地的图形化工具，用于**长期追踪代理订阅里各个节点的连通性与测速稳定性**，并对外提供一个干净的订阅接口。
 
