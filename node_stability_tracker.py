@@ -56,7 +56,21 @@ except Exception:
 # 内核探测模块（sing-box Clash API，准确测所有协议延迟+真实下载速度）
 import singbox_probe as sb
 
-__version__ = "1.9.12"
+__version__ = "1.9.13"
+
+# v1.9.13 修复（2026-11-10，「定时测速永久停摆」实证）：
+#  P0 故障轮分支（_worker 结果处理段）只写了状态栏，没有执行任何轮次收尾；
+#     而 _busy=False / 按钮恢复 / _pb_finish / _schedule_next 全塞在 _fill()
+#     的 finally，_fill 又只在非故障轮被调用 → 一旦判故障轮，_busy 永久 True、
+#     按钮全灰、定时器不重排（_run_round 开头已 after_cancel 掉 _timer），
+#     进程与 /sub 假装正常但测速再也不跑。修复=抽出 _finish_round_ui 统一收尾，
+#     故障轮 / 正常轮 / 三处异常早退全部走它。
+#  P0 轮次路径上的模态弹窗（无有效节点 / 内核错误 / 本轮全灭 / 结果处理失败 /
+#     渲染失败）在无人值守常驻模式下会阻塞 Tk 主线程 → 改为非阻塞状态栏提示。
+#  P1 故障轮探针阈值 0.5→0.30：自有节点 18 条里 7 条是每轮必挂的
+#     （v6.203555.xyz 四条 + *:443 vmess 三条），天花板只有 11/18=61%，
+#     链路稍一抖动就跌破 50% 误判。真内核故障会是 0/18，30% 线仍能抓住。
+#     实时判定与 drop_bad_rounds 离线剔除共用同一常量，避免写进去又被剔掉。
 
 # v1.9 修复（2026-10-24，「GUI 显示 10 个但 v2rayN 只进 5 个」）：
 #  P0-4 vmess 节点被 v2rayN 全量丢弃（根因读 v2rayN 源码实锤）：
@@ -663,6 +677,9 @@ def append_history(records):
 BAD_ROUND_RATE = 0.05
 # 故障轮判定所需的最小样本（小样本不做判定，避免误伤）
 BAD_ROUND_MIN_N = 10
+# 自有节点探针的故障阈值（v1.9.13：0.5 → 0.30，见文件头 P1 说明）
+# 实时判定与 drop_bad_rounds 离线剔除共用，必须保持一致
+OWN_PROBE_BAD_RATE = 0.30
 # 可用率只统计最近 N 次（老数据不代表现在的状态）
 RECENT_N = 8
 
@@ -690,7 +707,7 @@ def drop_bad_rounds(rows, own_keys=None):
         pool = probe if probe else g
         ok = sum(1 for r in pool
                  if str(r.get("ok", "")).strip() in ("1", "true", "yes", "是"))
-        threshold = 0.5 if probe else BAD_ROUND_RATE
+        threshold = OWN_PROBE_BAD_RATE if probe else BAD_ROUND_RATE
         if ok / len(pool) < threshold:
             dropped.append((ts, len(g), ok))
         else:
@@ -2580,8 +2597,8 @@ class App(tk.Tk):
             self.after(0, self._refresh_dead_label, now)
 
         if not items:
-            self.after(0, lambda: messagebox.showwarning(
-                "无有效节点", "没有解析出任何有效节点，请检查输入格式/网络。"))
+            self.after(0, self.status_msg,
+                       "⚠️ 无有效节点：没有解析出任何有效节点，请检查输入格式/网络。")
             self.after(0, self._end_round_ui)
             return
 
@@ -2724,7 +2741,7 @@ class App(tk.Tk):
                         if r["tag"] in spd:
                             r["speed_kbs"] = spd[r["tag"]]
         except Exception as e:
-            self.after(0, lambda: messagebox.showerror("内核错误", f"sing-box 运行异常:\n{e}"))
+            self.after(0, self.status_msg, f"⚠️ 内核错误：sing-box 运行异常：{e}")
             self.after(0, self._end_round_ui)
             return
 
@@ -2749,7 +2766,7 @@ class App(tk.Tk):
                 if _own_res:
                     _ok_n = sum(1 for r in _own_res if r.get("ok"))
                     _rate = _ok_n / len(_own_res)
-                    if _rate < 0.5:
+                    if _rate < OWN_PROBE_BAD_RATE:
                         _bad_round = True
                         _bad_desc = (f"自有节点 {len(_own_res)} 个仅 {_ok_n} 个测通"
                                      f"（{_rate*100:.0f}%），内核/代理可能异常")
@@ -2761,17 +2778,13 @@ class App(tk.Tk):
                     _bad_round = True
                     _bad_desc = (f"本轮 {len(res)} 个节点仅 {_ok_n} 个测通"
                                  f"（{_rate*100:.1f}%），低于 {BAD_ROUND_RATE*100:.0f}% 剔除线")
+            # v1.9.13：常驻模式经常无人值守，模态弹窗会阻塞 Tk 主线程 →
+            # 一律改成非阻塞状态栏提示；内核原文另见 dist/kernel_errors.log
+            _note = ""
             if _bad_round:
-                _extra = (f"\n\n【内核报错原文】\n{_kerr[-800:]}" if _kerr else "")
-                self.after(0, lambda: messagebox.showwarning(
-                    "⚠️ 本轮全灭（历史数据已冻结）",
-                    f"{_bad_desc}，本轮已按故障轮剔除、不进统计。\n\n"
-                    "可能原因：\n"
-                    "· sing-box 内核异常 / 端口冲突\n"
-                    "· 拉源代理失效（①号页 socks5h://127.0.0.1:10809）\n"
-                    "· gh_proxy 失效（已内置自动切换，全挂会另出提示）\n\n"
-                    "免费节点存活率低是常态，不算故障；连续全灭时订阅会停更。"
-                    + _extra))
+                _note = (f"{_bad_desc}，本轮数据已丢弃"
+                         + (f" · 内核报错：{_kerr[-120:]}" if _kerr else ""))
+                self.after(0, self.status_msg, _note)
             records = []
             for r in res:
                 records.append({
@@ -2807,16 +2820,16 @@ class App(tk.Tk):
                 # 订阅服务内容随测速结果自动更新
                 self.after(0, self._update_served)
             else:
-                self.after(0, self.status_msg,
-                           "⚠️ 本轮判定为故障轮，已丢弃未写入历史（既有统计不受影响）")
+                # v1.9.13 P0：故障轮同样必须收尾，否则 _busy 卡死、定时器不重排
+                self.after(0, self._finish_round_ui, cancelled, _note)
             # 内核报错但没构成全灭轮时，也要在状态栏留一句（完整原文见 kernel_errors.log）
             if _kerr and not _bad_round:
                 self.after(0, self.status_msg,
                            f"⚠️ 内核有报错（详见 kernel_errors.log）：{_kerr[-120]}")
         except Exception:
             err = traceback.format_exc()
-            self.after(0, lambda: messagebox.showerror(
-                "测速结果处理失败", "结果已测出，但落盘/统计环节出错：\n\n" + err[-1500:]))
+            self.after(0, self.status_msg,
+                       "⚠️ 测速结果处理失败：" + err[-300:])
             self.after(0, self._end_round_ui)
 
     # ------------------------------------------------------ 本轮收尾（解锁 UI）
@@ -2833,6 +2846,45 @@ class App(tk.Tk):
         except Exception:
             pass
         self._pb_stop()
+        # v1.9.13：异常早退也要把下一轮排上，否则定时模式同样永久停摆
+        if self._running:
+            self._schedule_next()
+
+    # ------------------------------------------------------ 统一轮次收尾（v1.9.13）
+    def _finish_round_ui(self, cancelled=False, note=""):
+        """所有轮次出口共用：正常轮 / 故障轮 / 取消 / 异常早退都必须走到这里。
+
+        v1.9.12 之前只有 _fill() 的 finally 在做收尾，故障轮分支绕过 _fill，
+        导致 _busy 永久 True、按钮灰掉、_schedule_next 不执行 —— 进程和 /sub
+        看着都正常，定时测速却再也不会跑。
+        """
+        rnd = self._round
+        self._busy = False
+        for btn in ("btn_toggle", "btn_once"):
+            try:
+                getattr(self, btn).config(state="normal")
+            except Exception:
+                pass
+        try:
+            self.btn_cancel.config(state="disabled")
+        except Exception:
+            pass
+        self._pb_finish(cancelled)
+        if note:
+            try:
+                self.lbl_progress.set(
+                    f"⚠️ 本轮数据已丢弃（不影响后续定时轮次）：{note}")
+            except Exception:
+                pass
+        if self._running:
+            # 定时模式必须重排下一轮；故障提示作为后缀带进状态栏
+            self._schedule_next(note)
+        elif cancelled:
+            self.status.set(f"第 {rnd} 轮已取消 — 已测节点结果已记录，未测节点跳过")
+        else:
+            self.status.set(
+                ("⚠️ " + note) if note
+                else "单轮测速完成 ✓  — 最终订阅 = 核心(稳) ∪ 新秀(动态)")
 
     # ------------------------------------------------------ 结果表排序
     def _sort_tree(self, col):
@@ -2916,22 +2968,10 @@ class App(tk.Tk):
             self.lbl_stats.set(txt)
         except Exception:
             err = traceback.format_exc()
-            messagebox.showerror("渲染结果失败", "测速结果渲染表格时出错：\n\n" + err[-1200:])
+            self.status_msg("⚠️ 渲染结果失败：" + err[-300:])
         finally:
-            self._busy = False
-            try:
-                self.btn_once.config(state="normal")
-            except Exception:
-                pass
-            self.btn_toggle.config(state="normal")
-            self._pb_finish(cancelled)
-            if cancelled:
-                self.status.set(f"第 {rnd} 轮已取消 — 已测节点结果已记录，未测节点跳过")
-            else:
-                self.status.set("单轮测速完成 ✓  — 最终订阅 = 核心(稳) ∪ 新秀(动态)")
-            # 定时模式：无论本轮是否取消，都按原计划排下一轮（取消=跳过本轮）
-            if self._running:
-                self._schedule_next()
+            # v1.9.13：收尾统一走 _finish_round_ui（故障轮分支也会调用它）
+            self._finish_round_ui(cancelled)
 
     # ------------------------------------------------------ 进度条 / 取消 辅助
     def _pb_to_determinate(self, n):
@@ -3008,14 +3048,16 @@ class App(tk.Tk):
                 self._timer = None
             self.status.set("定时测速已停止。")
 
-    def _schedule_next(self):
+    def _schedule_next(self, note=""):
         if not self._running:
             return
         hrs = float(self.interval.get() or 3)
         ms = int(hrs * 3600 * 1000)
         self._timer = self.after(ms, self._run_round)
         nxt = datetime.datetime.now() + datetime.timedelta(hours=hrs)
-        self.status.set(f"定时测速运行中 · 下次 {nxt.strftime('%m-%d %H:%M')}")
+        _suffix = " · ⚠️ 上一轮数据已丢弃" if note else ""
+        self.status.set(
+            f"定时测速运行中 · 下次 {nxt.strftime('%m-%d %H:%M')}{_suffix}")
 
 
 # ============================================================ 单例与残留清理
